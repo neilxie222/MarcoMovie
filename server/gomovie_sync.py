@@ -324,7 +324,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
         for key, value in (headers or {}).items():
             self.send_header(key, value)
-        self.send_header("Content-Length", str(len(body)))
+        if code != 204:  # 204 has no body by definition; a Content-Length there upsets strict clients
+            self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
