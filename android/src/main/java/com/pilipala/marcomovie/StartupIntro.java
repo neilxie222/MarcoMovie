@@ -169,7 +169,7 @@ final class StartupIntro extends FrameLayout {
             paint.setAlpha(Math.round(255 * type));
             paint.setTextAlign(Paint.Align.CENTER);
             paint.setTextSize(33);
-            c.drawText("Marco Movie", 0, 87 + 5 * (1 - type), paint);
+            c.drawText("Gomovie", 0, 87 + 5 * (1 - type), paint);
             paint.setColor(0xff9298a1);
             paint.setAlpha(Math.round(255 * type));
             paint.setTextSize(9);

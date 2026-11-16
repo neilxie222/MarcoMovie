@@ -848,13 +848,13 @@ final class MobileShell {
                 a.windowWidth() < a.dp(360) || a.getResources().getConfiguration().fontScale > 1.2f;
         TextView brandTitle =
                 a.text(
-                        a.privateMode ? "隐私 · 退出" : compactBrand ? "Marco\nMovie" : "Marco Movie",
+                        a.privateMode ? "隐私 · 退出" : "Gomovie",
                         compactBrand ? 12 : 14,
                         Color.WHITE);
         brandTitle.setTypeface(null, Typeface.BOLD);
-        brandTitle.setSingleLine(!compactBrand);
-        brandTitle.setMaxLines(compactBrand ? 2 : 1);
-        brandTitle.setContentDescription(a.privateMode ? "退出隐私空间" : "Marco Movie");
+        brandTitle.setSingleLine(true);
+        brandTitle.setMaxLines(1);
+        brandTitle.setContentDescription(a.privateMode ? "退出隐私空间" : "Gomovie");
         brandRow.addView(brandTitle);
         brandRow.setMinimumHeight(a.dp(44));
         brandRow.setOnClickListener(
@@ -2075,7 +2075,7 @@ final class MobileShell {
 
         ImageView logo = new ImageView(a);
         logo.setImageResource(R.drawable.logo_mark);
-        logo.setContentDescription(a.privateMode ? "退出隐私空间" : "Marco Movie");
+        logo.setContentDescription(a.privateMode ? "退出隐私空间" : "Gomovie");
         logo.setOnClickListener(
                 v -> {
                     if (a.privateMode) PrivacySpace.switchSpace(a, false);
