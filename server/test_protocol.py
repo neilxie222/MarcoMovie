@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import threading
+import urllib.parse
 from pathlib import Path
 
 import gomovie_sync as gs
@@ -173,6 +174,69 @@ def main():
     check("new password logs in", request(
         port, "POST", "/admin/login", body="password=newadminpass",
         headers={"Content-Type": "application/x-www-form-urlencoded"})[0], 302)
+
+    print("account expiry")
+    from datetime import datetime, timedelta, timezone
+
+    past = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+    future = (datetime.now(timezone.utc) + timedelta(days=10)).strftime("%Y-%m-%d")
+    store.add_device("lapsed", "default", "pw-lapsed", past)
+    store.add_device("dated", "default", "pw-dated", future)
+    status, _, body = request(port, "GET", url, auth=("lapsed", "pw-lapsed"))
+    check("expired account -> 403", status, 403)
+    check("expired body names the expiry", b"expired" in body, True)
+    check("dated account still works", request(port, "GET", url, auth=("dated", "pw-dated"))[0], 200)
+
+    csrf = gs.hmac.new(store.config["secret"].encode(), b"csrf", gs.hashlib.sha256).hexdigest()[:32]
+    status, headers, _ = request(port, "POST", "/admin/login", body="password=newadminpass",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    cookie = headers.get("Set-Cookie", "").split(";")[0]
+    check("panel login for admin actions", cookie.startswith("gs_session="), True)
+    form_headers = {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"}
+    check("extend expired account", request(
+        port, "POST", "/admin/device-extend", body=f"csrf={csrf}&name=lapsed&days=30",
+        headers=form_headers)[0], 302)
+    check("extended account works again", request(port, "GET", url, auth=("lapsed", "pw-lapsed"))[0], 200)
+    check("clear expiry", request(
+        port, "POST", "/admin/device-expiry", body=f"csrf={csrf}&name=dated&expires=",
+        headers=form_headers)[0], 302)
+    check("permanent account still works", request(port, "GET", url, auth=("dated", "pw-dated"))[0], 200)
+    check("bad expiry date rejected", request(
+        port, "POST", "/admin/device-expiry", body=f"csrf={csrf}&name=dated&expires=2026-13-99",
+        headers=form_headers)[0], 302)
+
+    print("editing payload from the panel")
+    before = request(port, "GET", url, auth=auth)[2]
+    edited = json.dumps({"schema": "marco-movie-sync", "version": 2, "updatedAt": 42, "watch_history": [], "favorites": [{"t": "edited"}]})
+    status, headers, _ = request(port, "POST", "/admin/edit-save",
+                                 body="csrf=" + csrf + "&space=default&content=" + urllib.parse.quote(edited),
+                                 headers=form_headers)
+    check("edit-save -> 302", status, 302)
+    after = request(port, "GET", url, auth=auth)[2]
+    check("edited payload is live", json.loads(after)["favorites"], [{"t": "edited"}])
+    check("edit kept a version of the old payload", any(store.version_dir("default").glob("*.json")), True)
+    check("broken json refused", request(
+        port, "POST", "/admin/edit-save", body="csrf=" + csrf + "&space=default&content=" + urllib.parse.quote("{not json"),
+        headers=form_headers)[0], 302)
+    check("payload untouched after refused save", request(port, "GET", url, auth=auth)[2], after)
+    edit_page = request(port, "GET", "/admin/edit?space=default", headers={"Cookie": cookie})[2]
+    check("edit page has a textarea", b"<textarea" in edit_page, True)
+    check("edit page renders the payload", b"watch_history" in edit_page, True)
+
+    print("editing public config from the panel")
+    (store.root / "public").mkdir(parents=True, exist_ok=True)
+    (store.root / "public" / "tvbox-demo.json").write_text('{"sites": []}', encoding="utf-8")
+    check("config list page", b"tvbox-demo.json" in request(port, "GET", "/admin/configs", headers={"Cookie": cookie})[2], True)
+    cfg = '{"sites": [{"key": "x"}], "lives": []}'
+    check("config-save -> 302", request(
+        port, "POST", "/admin/config-save", body="csrf=" + csrf + "&name=tvbox-demo.json&content=" + urllib.parse.quote(cfg),
+        headers=form_headers)[0], 302)
+    check("served config updated", request(port, "GET", "/config/tvbox-demo.json")[2], cfg.encode())
+    check("config history kept", any((store.root / "public" / ".versions").glob("tvbox-demo.json.*")), True)
+    check("bad config json refused", request(
+        port, "POST", "/admin/config-save", body="csrf=" + csrf + "&name=tvbox-demo.json&content=" + urllib.parse.quote("[1,2"),
+        headers=form_headers)[0], 302)
+    check("config untouched after refused save", request(port, "GET", "/config/tvbox-demo.json")[2], cfg.encode())
 
     print("logging")
     entries = store.recent_log(500)

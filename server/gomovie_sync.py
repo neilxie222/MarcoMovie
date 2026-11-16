@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -92,12 +92,14 @@ class Store:
         return sorted(d.name for d in self.data.iterdir() if d.is_dir() and not d.name.startswith("."))
 
     # -- devices -----------------------------------------------------------
-    def add_device(self, name: str, space: str, password: str) -> None:
+    def add_device(self, name: str, space: str, password: str, expires: str = "", note: str = "") -> None:
         self.devices["devices"][name] = {
             "space": space,
             "hash": hash_password(password),
             "enabled": True,
             "created": utc_iso(),
+            "expires": expires,  # "" = never expires; otherwise a YYYY-MM-DD day (UTC, inclusive)
+            "note": note,
         }
         self.save_devices()
 
@@ -105,10 +107,11 @@ class Store:
         return self.devices["devices"].get(name)
 
     def device_by_password(self, user: str, password: str):
+        """Match name+password only; enable/expiry policy lives in the request handler."""
         dev = self.devices["devices"].get(user)
-        if not dev or not dev.get("enabled", True):
+        if not dev:
             return None
-        return dev if verify_password(password, dev["hash"]) else None
+        return dev if verify_password(password, dev.get("hash", "")) else None
 
     # -- payload versions --------------------------------------------------
     def snapshot(self, space: str, content: bytes) -> None:
@@ -198,6 +201,37 @@ class Store:
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def expiry_state(expires: str) -> tuple[str, int]:
+    """Return ("none" | "expired" | "soon" | "ok", days_left) for a YYYY-MM-DD expiry."""
+    if not expires:
+        return "none", 0
+    try:
+        end = datetime.strptime(expires, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "none", 0
+    left = (end.date() - datetime.now(timezone.utc).date()).days
+    if left < 0:
+        return "expired", left
+    return ("soon" if left <= 7 else "ok"), left
+
+
+def extend_expiry(current: str, days: int) -> str:
+    """Push an expiry out by `days`, counting from today when it already lapsed."""
+    base = datetime.now(timezone.utc).date()
+    if current:
+        try:
+            parsed = datetime.strptime(current, "%Y-%m-%d").date()
+            if parsed > base:
+                base = parsed
+        except ValueError:
+            pass
+    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 def space_lock(space: str) -> threading.Lock:
@@ -529,6 +563,18 @@ class Handler(BaseHTTPRequestHandler):
             self.note(401, user)
             self.respond(401, b"invalid credentials", headers={"WWW-Authenticate": 'Basic realm="gomovie-sync"'}, ctype="text/plain")
             return None
+        if not record.get("enabled", True):
+            self.drain()
+            self.note(403, user)
+            self.respond(403, b"account disabled", ctype="text/plain")
+            return None
+        expires = record.get("expires") or ""
+        if expires and expires < today_utc():
+            # Expired on purpose, not a bad password: say so in the body and in the log.
+            self.drain()
+            self.note(403, user)
+            self.respond(403, b"account expired on " + expires.encode(), ctype="text/plain")
+            return None
         return user, record
 
     def dav_space(self, method: str, device: str, space: str) -> None:
@@ -658,11 +704,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(302, b"", headers={"Location": "/admin/login"})
 
         nav = (
-            '<a href="/admin">概览</a><a href="/admin/versions">版本</a>'
+            '<a href="/admin">概览</a><a href="/admin/edit">同步数据</a>'
+            '<a href="/admin/configs">配置文件</a><a href="/admin/versions">版本</a>'
             '<a href="/admin/log">日志</a><a href="/admin/logout">退出</a>'
         )
         if path == "/admin":
             return self.respond(200, page("Gomovie Sync", self.dashboard(query), nav), ctype="text/html; charset=utf-8")
+        if path == "/admin/edit":
+            return self.respond(200, page("编辑同步数据", self.edit_page(query), nav), ctype="text/html; charset=utf-8")
+        if path == "/admin/configs":
+            return self.respond(200, page("配置文件", self.configs_page(query), nav), ctype="text/html; charset=utf-8")
+        if path == "/admin/config-edit":
+            return self.respond(200, page("编辑配置", self.config_edit_page(query), nav), ctype="text/html; charset=utf-8")
         if path == "/admin/versions":
             return self.respond(200, page("版本", self.versions_page(query), nav), ctype="text/html; charset=utf-8")
         if path == "/admin/versions/download":
@@ -712,19 +765,23 @@ class Handler(BaseHTTPRequestHandler):
             name = (form.get("name") or "").strip()[:32]
             space = (form.get("space") or "default").strip()[:40]
             password = form.get("password") or generate_password()
+            expires = (form.get("expires") or "").strip()
+            note = (form.get("note") or "").strip()[:60]
             if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", name or ""):
-                return self.redirect("/admin", "设备名只能用字母数字 . _ -")
+                return self.redirect("/admin", "账号名只能用字母数字 . _ -")
             if name in self.store.devices["devices"]:
-                return self.redirect("/admin", "设备名已存在")
+                return self.redirect("/admin", "账号名已存在")
             if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", space):
                 return self.redirect("/admin", "空间名不合法")
-            self.store.add_device(name, space, password)
+            if expires and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expires):
+                return self.redirect("/admin", "到期日格式应为 YYYY-MM-DD")
+            self.store.add_device(name, space, password, expires, note)
             self.store.space_dir(space).mkdir(parents=True, exist_ok=True)
             return self.respond(
                 200,
                 page(
-                    "设备已创建",
-                    self.credential_block(name, space, password),
+                    "账号已创建",
+                    self.credential_block(name, space, password, expires),
                     '<a href="/admin">概览</a>',
                 ),
                 ctype="text/html; charset=utf-8",
@@ -733,15 +790,40 @@ class Handler(BaseHTTPRequestHandler):
             name = form.get("name", "")
             record = self.store.device(name)
             if not record:
-                return self.redirect("/admin", "设备不存在")
+                return self.redirect("/admin", "账号不存在")
             password = generate_password()
             record["hash"] = hash_password(password)
             self.store.save_devices()
             return self.respond(
                 200,
-                page("密码已重置", self.credential_block(name, record["space"], password), '<a href="/admin">概览</a>'),
+                page(
+                    "密码已重置",
+                    self.credential_block(name, record["space"], password, record.get("expires") or ""),
+                    '<a href="/admin">概览</a>',
+                ),
                 ctype="text/html; charset=utf-8",
             )
+        if action == "device-extend":
+            record = self.store.device(form.get("name", ""))
+            if not record:
+                return self.redirect("/admin", "账号不存在")
+            try:
+                days = max(1, min(3650, int(form.get("days", "30"))))
+            except ValueError:
+                days = 30
+            record["expires"] = extend_expiry(record.get("expires") or "", days)
+            self.store.save_devices()
+            return self.redirect("/admin", f"{form.get('name','')} 到期日已延到 {record['expires']}")
+        if action == "device-expiry":
+            record = self.store.device(form.get("name", ""))
+            if not record:
+                return self.redirect("/admin", "账号不存在")
+            value = (form.get("expires") or "").strip()
+            if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                return self.redirect("/admin", "到期日格式应为 YYYY-MM-DD")
+            record["expires"] = value
+            self.store.save_devices()
+            return self.redirect("/admin", f"{form.get('name','')} 到期日已改为 {value or '永久'}")
         if action == "device-toggle":
             record = self.store.device(form.get("name", ""))
             if record:
@@ -776,10 +858,57 @@ class Handler(BaseHTTPRequestHandler):
                 tmp.write_bytes(source.read_bytes())
                 os.replace(tmp, target)
             return self.redirect("/admin/versions", f"已回滚到 {vid}，各设备下次同步即生效")
+        if action == "edit-save":
+            space = (form.get("space") or "default").strip()
+            content = form.get("content", "")
+            back = "/admin/edit?space=" + urllib.parse.quote(space)
+            if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", space):
+                return self.redirect(back, "空间名不合法")
+            try:
+                json.loads(content)
+            except ValueError:
+                return self.redirect(back, "JSON 格式错误，没有保存")
+            target = self.store.space_file(space)
+            with space_lock(space):
+                if target.is_file():
+                    self.store.snapshot(space, target.read_bytes())
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix(".tmp")
+                tmp.write_text(content, encoding="utf-8")
+                os.replace(tmp, target)
+            return self.redirect(back, "已保存，旧内容已存为历史版本")
+        if action == "config-save":
+            name = form.get("name", "")
+            content = form.get("content", "")
+            if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,60}\.json", name or ""):
+                return self.respond(400, b"bad name", ctype="text/plain")
+            back = "/admin/config-edit?name=" + urllib.parse.quote(name)
+            try:
+                json.loads(content)
+            except ValueError:
+                return self.redirect(back, "JSON 格式错误，没有保存")
+            folder = self.store.root / "public"
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / name
+            if target.is_file():
+                history = folder / ".versions"
+                history.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                (history / f"{name}.{stamp}").write_bytes(target.read_bytes())
+                for old in sorted(history.glob(f"{name}.*"))[:-20]:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(tmp, target)
+            return self.redirect(back, "配置文件已保存（旧版本留在 public/.versions）")
         return self.respond(404, b"unknown action", ctype="text/plain")
 
     def redirect(self, location: str, message: str) -> None:
-        target = f"{location}?ok={urllib.parse.quote(message)}"
+        joiner = "&" if "?" in location else "?"
+        target = f"{location}{joiner}ok={urllib.parse.quote(message)}"
         return self.respond(302, b"", headers={"Location": target})
 
     # -- admin views -------------------------------------------------------
@@ -794,15 +923,111 @@ class Handler(BaseHTTPRequestHandler):
             "<div style='height:12px'></div><button style='width:100%'>登录</button></form></div>",
         )
 
-    def credential_block(self, name: str, space: str, password: str) -> str:
+    def credential_block(self, name: str, space: str, password: str, expires: str = "") -> str:
         url = f"{self.public_url}/dav/{space}/{FILE_NAME}"
+        expiry_line = (
+            f"<div>到期：<code>{html.escape(expires)}</code>（当天有效，次日零点起该账号地址失效）</div>"
+            if expires
+            else "<div>到期：<code>永久</code></div>"
+        )
         return (
-            f"<h2>设备「{html.escape(name)}」的配置</h2>"
+            f"<h2>账号「{html.escape(name)}」的配置</h2>"
             "<div class=cred><div class=muted>密码只显示这一次，丢了就点「重置密码」。</div>"
             f"<div>地址：<code>{html.escape(url)}</code></div>"
             f"<div>账号：<code>{html.escape(name)}</code></div>"
-            f"<div>密码：<code>{html.escape(password)}</code></div></div>"
+            f"<div>密码：<code>{html.escape(password)}</code></div>"
+            f"{expiry_line}</div>"
             "<p class=muted>在 app 里：设置 → 多端网络同步 → WebDAV，把上面三项填进去。</p>"
+        )
+
+    def edit_page(self, query: dict) -> str:
+        """Textarea editor for the synced payload of a space."""
+        spaces = sorted(set(self.store.spaces()) | set(self.store.state["spaces"]) | {"default"})
+        space = query.get("space", [spaces[0]])[0]
+        if space not in spaces:
+            space = spaces[0]
+        target = self.store.space_file(space)
+        content = ""
+        if target.is_file():
+            try:
+                content = json.dumps(
+                    json.loads(target.read_text(encoding="utf-8")), ensure_ascii=False, indent=2
+                )
+            except ValueError:
+                content = target.read_text(encoding="utf-8", errors="replace")
+        options = "".join(
+            f"<option value='{html.escape(s)}' {'selected' if s == space else ''}>{html.escape(s)}</option>"
+            for s in spaces
+        )
+        return (
+            self.flash(query)
+            + f"<h2>编辑同步数据 · <code>{html.escape(space)}</code></h2>"
+            + "<form method=get action=/admin/edit class=row>"
+            f"<select name=space onchange=this.form.submit()>{options}</select>"
+            "<span class=muted>切换空间后编辑对应的 marco-movie-sync.json</span></form>"
+            "<div class=card style='margin-top:14px'><form method=post action=/admin/edit-save>"
+            f"<input type=hidden name=csrf value='{self.csrf()}'>"
+            f"<input type=hidden name=space value='{html.escape(space)}'>"
+            "<textarea name=content spellcheck=false "
+            "style='width:100%;min-height:460px;background:#16161a;color:#e8e8ee;border:1px solid #31313a;"
+            "border-radius:12px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:13px;"
+            f"line-height:1.5'>{html.escape(content)}</textarea>"
+            "<div class=row style='margin-top:12px'><button>保存</button>"
+            "<span class=muted>保存前会把当前内容存成一份历史版本，改坏了能在「版本」页回滚。</span></div>"
+            "</form></div>"
+        )
+
+    def configs_page(self, query: dict) -> str:
+        """List the public config files the app can import by URL."""
+        folder = self.store.root / "public"
+        folder.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for path in sorted(folder.glob("*.json")):
+            stat = path.stat()
+            stamp = datetime.fromtimestamp(stat.st_mtime, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+            url = f"{self.public_url}/config/{urllib.parse.quote(path.name)}"
+            rows.append(
+                f"<tr><td><code>{html.escape(path.name)}</code></td><td>{fmt_size(stat.st_size)}</td>"
+                f"<td>{stamp}</td><td><a href='{html.escape(url)}' target=_blank>打开</a> "
+                f"<a href='/admin/config-edit?name={urllib.parse.quote(path.name)}'>编辑</a></td></tr>"
+            )
+        table = (
+            "<table><tr><th>文件</th><th>大小</th><th>更新时间</th><th>操作</th></tr>"
+            + ("".join(rows) or "<tr><td colspan=4 class=muted>public/ 下还没有配置文件。</td></tr>")
+            + "</table>"
+        )
+        return (
+            self.flash(query)
+            + "<h2>配置文件</h2><div class=card>" + table + "</div>"
+            "<p class=muted>这些文件通过 <code>/config/&lt;文件名&gt;</code> 公开提供，app 里导入配置时填的就是这个地址。"
+            "编辑前会在 public/.versions 留一份旧版本。</p>"
+        )
+
+    def config_edit_page(self, query: dict) -> str:
+        name = query.get("name", [""])[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,60}\.json", name or ""):
+            return "<div class=flash>文件名不合法</div>"
+        target = self.store.root / "public" / name
+        if not target.is_file():
+            return f"<div class=flash>文件不存在：<code>{html.escape(name)}</code></div>"
+        try:
+            content = json.dumps(
+                json.loads(target.read_text(encoding="utf-8")), ensure_ascii=False, indent=2
+            )
+        except ValueError:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        return (
+            self.flash(query)
+            + f"<h2>编辑 <code>{html.escape(name)}</code></h2>"
+            "<div class=card><form method=post action=/admin/config-save>"
+            f"<input type=hidden name=csrf value='{self.csrf()}'>"
+            f"<input type=hidden name=name value='{html.escape(name)}'>"
+            "<textarea name=content spellcheck=false "
+            "style='width:100%;min-height:460px;background:#16161a;color:#e8e8ee;border:1px solid #31313a;"
+            "border-radius:12px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:13px;"
+            f"line-height:1.5'>{html.escape(content)}</textarea>"
+            "<div class=row style='margin-top:12px'><button>保存</button>"
+            "<a class=btn href='/admin/configs'>返回</a></div></form></div>"
         )
 
     def dashboard(self, query: dict) -> str:
@@ -826,13 +1051,31 @@ class Handler(BaseHTTPRequestHandler):
         for name, rec in sorted(devices.items()):
             res = state["devices"].get(name, {})
             badge = "<span class='pill ok'>启用</span>" if rec.get("enabled", True) else "<span class='pill off'>停用</span>"
+            expires = rec.get("expires") or ""
+            kind, left = expiry_state(expires)
+            if kind == "none":
+                expiry_cell = "<span class=muted>永久</span>"
+            elif kind == "expired":
+                expiry_cell = f"<span class='pill off'>{html.escape(expires)} · 已过期</span>"
+            else:
+                cls = "pill off" if kind == "soon" else "pill"
+                expiry_cell = f"<span class='{cls}'>{html.escape(expires)} · 剩 {left} 天</span>"
+            note = rec.get("note") or ""
             rows.append(
-                f"<tr><td><code>{html.escape(name)}</code></td><td>{html.escape(rec['space'])}</td>"
-                f"<td>{badge}</td><td>{fmt_time(res.get('last_get', ''))}</td>"
+                f"<tr><td><code>{html.escape(name)}</code>"
+                + (f"<div class=muted style='font-size:12px'>{html.escape(note)}</div>" if note else "")
+                + f"</td><td>{html.escape(rec['space'])}</td>"
+                f"<td>{badge}</td><td>{expiry_cell}</td><td>{fmt_time(res.get('last_get', ''))}</td>"
                 f"<td>{fmt_time(res.get('last_put', ''))}</td><td>{fmt_size(res.get('size', 0))}</td>"
                 "<td><form class=inline method=post action=/admin/device-token>"
                 f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
                 "<button class='ghost'>重置密码</button></form> "
+                "<form class=inline method=post action=/admin/device-extend>"
+                f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
+                "<input type=hidden name=days value='30'><button class='ghost'>+30天</button></form> "
+                "<form class=inline method=post action=/admin/device-expiry>"
+                f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
+                "<input type=hidden name=expires value=''><button class='ghost'>改到期</button></form> "
                 "<form class=inline method=post action=/admin/device-toggle>"
                 f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
                 "<button class='ghost'>启/停</button></form> "
@@ -841,26 +1084,30 @@ class Handler(BaseHTTPRequestHandler):
                 "<button class='danger'>删除</button></form></td></tr>"
             )
         table = (
-            "<table><tr><th>设备</th><th>空间</th><th>状态</th><th>最后读取</th><th>最后写入</th><th>大小</th><th>操作</th></tr>"
-            + ("".join(rows) or "<tr><td colspan=7 class=muted>还没有设备，先在下面建一个。</td></tr>")
+            "<table><tr><th>设备</th><th>空间</th><th>状态</th><th>到期</th><th>最后读取</th><th>最后写入</th><th>大小</th><th>操作</th></tr>"
+            + ("".join(rows) or "<tr><td colspan=8 class=muted>还没有设备，先在下面建一个。</td></tr>")
             + "</table>"
         )
 
         options = "".join(f"<option value='{html.escape(s)}'>{html.escape(s)}</option>" for s in spaces or ["default"])
         add_form = (
-            "<h2>新增设备</h2><div class=card><form method=post action=/admin/device-add>"
+            "<h2>新增账号</h2><div class=card><form method=post action=/admin/device-add>"
             f"<input type=hidden name=csrf value='{self.csrf()}'>"
-            "<div class=row><div style='flex:1;min-width:160px'><input type=text name=name placeholder='设备名，如 ipad' required></div>"
-            f"<div style='flex:1;min-width:160px'><select name=space>{options}</select></div>"
-            "<div style='flex:1;min-width:200px'><input type=text name=password placeholder='密码（留空自动生成）'></div>"
-            "<div><button>创建设备</button></div></div></form></div>"
+            "<div class=row><div style='flex:1;min-width:150px'><input type=text name=name placeholder='账号名，如 ipad' required></div>"
+            "<div style='flex:1;min-width:180px'><input type=text name=password placeholder='密码（留空自动生成）'></div>"
+            f"<div style='flex:0 0 130px'><select name=space>{options}</select></div>"
+            "<div style='flex:0 0 170px'><input type=date name=expires title='到期日，留空=永久'></div>"
+            "<div style='flex:1;min-width:150px'><input type=text name=note placeholder='备注（谁的设备）'></div>"
+            "<div><button>创建</button></div></div>"
+            "<p class=muted style='margin:12px 0 0'>到期日按 UTC 计算，当天仍可用，次日零点起该账号的地址立刻失效（403 account expired）。</p>"
+            "</form></div>"
         )
 
         return (
             self.flash(query)
             + f"<div class=cards>{card_html}</div>"
             + f"<h2>空间 {html.escape(space)} 的内容</h2><div class=card>{self.payload_summary(space)}</div>"
-            + "<h2>设备</h2>" + table
+            + "<h2>账号</h2>" + table
             + add_form
             + "<h2>安全</h2><div class=card><form method=post action=/admin/admin-passwd class=row>"
             f"<input type=hidden name=csrf value='{self.csrf()}'>"
