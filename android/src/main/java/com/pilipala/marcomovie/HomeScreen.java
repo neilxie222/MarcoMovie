@@ -785,9 +785,6 @@ final class HomeScreen {
         boolean configSite = SourceController.isConfigOrNetdiskSite(site);
         boolean tv = a.isTvDevice();
         int tabIdx = 0;
-        if (!configSite || snapshot.skip.isEmpty()) {
-            addTab("推荐", "", tabIdx++);
-        }
         int visible =
                 tv
                         ? Math.min(128, snapshot.categories.size())
@@ -796,6 +793,7 @@ final class HomeScreen {
                                 : Math.min(4, snapshot.categories.size());
         for (int i = 0; i < visible; i++) {
             Cms.Category c = snapshot.categories.get(i);
+            if (Cms.isHiddenCategory(c.name)) continue;
             addTab(c.name, c.id, tabIdx++);
         }
         if (!tv && snapshot.categories.size() > visible) {

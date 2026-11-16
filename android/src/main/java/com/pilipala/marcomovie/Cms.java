@@ -2248,6 +2248,21 @@ public final class Cms {
         return m.find() ? unescapeXml(m.group(1)) : "";
     }
 
+    /**
+     * Category names the home navigation never shows. The list comes from each site's own {@code
+     * class/type_name} payload, so it can only be matched by name.
+     *
+     * <p>ponytail: a hardcoded name list is the whole of it — it will not catch a site that spells
+     * the same shelf differently (「电影」/「Movies」). Upgrade path: read the list from the user's
+     * config (e.g. a {@code hiddenCategories} array) instead of this constant.
+     */
+    private static final java.util.Set<String> HIDDEN_CATEGORY_NAMES =
+            new java.util.HashSet<>(java.util.Arrays.asList("电影片"));
+
+    static boolean isHiddenCategory(String name) {
+        return name != null && HIDDEN_CATEGORY_NAMES.contains(name.trim());
+    }
+
     public static List<Category> categories(String json) throws Exception {
         if (json != null && json.trim().startsWith("<")) {
             List<Category> result = new ArrayList<>();
@@ -2261,7 +2276,7 @@ public final class Cms {
                 c.id = m.group(1).trim();
                 c.name = unescapeXml(m.group(2));
                 if (c.name.isEmpty()) c.name = c.id;
-                if (!c.id.isEmpty()) result.add(c);
+                if (!c.id.isEmpty() && !isHiddenCategory(c.name)) result.add(c);
             }
             return result;
         }
@@ -2276,7 +2291,7 @@ public final class Cms {
                 c.id = optSafeString(j, "type_id", "").trim();
                 String cname = optSafeString(j, "type_name", "");
                 c.name = cname.isEmpty() ? c.id : cname;
-                if (!c.id.isEmpty()) result.add(c);
+                if (!c.id.isEmpty() && !isHiddenCategory(c.name)) result.add(c);
             }
         return result;
     }

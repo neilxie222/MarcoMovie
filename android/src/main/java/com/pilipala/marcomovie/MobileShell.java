@@ -1453,10 +1453,8 @@ final class MobileShell {
                             selectedCategoryId = currentCategories.get(0).id;
                         }
                         catRow.removeAllViews();
-                        if (!configSite || currentCategories.isEmpty()) {
-                            addCategoryChip(catRow, "推荐", "", this, fetchCategoryPage[0]);
-                        }
                         for (Cms.Category c : currentCategories) {
+                            if (Cms.isHiddenCategory(c.name)) continue;
                             addCategoryChip(catRow, c.name, c.id, this, fetchCategoryPage[0]);
                         }
                         if (savedCatX > 0) {
