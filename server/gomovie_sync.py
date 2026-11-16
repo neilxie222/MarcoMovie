@@ -50,6 +50,7 @@ class Store:
         self.logs = root / "logs"
         self.data.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(parents=True, exist_ok=True)
+        (root / "public").mkdir(parents=True, exist_ok=True)
         self.config = self._load_json(root / "config.json", None)
         self.devices = self._load_json(root / "devices.json", {"devices": {}})
         self.state = self._load_json(root / "state.json", {"devices": {}, "spaces": {}})
@@ -377,6 +378,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------
     def do_GET(self):
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        if path.startswith("/config/"):
+            return self.serve_config(path)
         if path.startswith("/dav/") or path.endswith(FILE_NAME):
             return self.dav("GET", path)
         if path == "/admin" or path.startswith("/admin/"):
@@ -428,6 +431,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.admin("POST", path)
         self.drain()
         return self.respond(405)
+
+    # -- static config files (app "导入配置地址" targets) -------------------
+    def serve_config(self, path: str) -> None:
+        """Serve ROOT/public/<name> so clients can import a config by URL. No auth: content only."""
+        name = path[len("/config/"):]
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,60}\.json", name or ""):
+            return self.respond(404, b"not found", ctype="text/plain")
+        target = self.store.root / "public" / name
+        if not target.is_file():
+            return self.respond(404, b"not found", ctype="text/plain")
+        body = target.read_bytes()
+        self.note(200, "config", len(body))
+        return self.respond(
+            200,
+            body,
+            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+            ctype="application/json; charset=utf-8",
+        )
 
     # -- webdav ------------------------------------------------------------
     def dav(self, method: str, path: str) -> None:
