@@ -60,6 +60,7 @@ class Store:
         self.state = self._load_json(root / "state.json", {"devices": {}, "spaces": {}})
         self.site_targets: dict[str, str] = {}
         self.live_targets: dict[str, str] = {}
+        self.disabled_keys: set[str] = set()
         self.load_sources()
         self._devices_mtime = self._devices_mtime_now()
         cfg = self.config or {}
@@ -166,9 +167,14 @@ class Store:
 
     # -- upstream sources behind the gateway -------------------------------
     def load_sources(self) -> None:
-        """Read ROOT/private/sources.json (the real, unpublished config) into key->url maps."""
+        """Read ROOT/private/sources.json (the real, unpublished config) into key->url maps.
+
+        Entries flagged `"disabled": true` stay in the file (so they can be switched back on)
+        but are not proxied: the gateway answers them with an empty list instead of the payload.
+        """
         self.site_targets = {}
         self.live_targets = {}
+        self.disabled_keys = set()
         path = self.root / "private" / "sources.json"
         try:
             master = json.loads(path.read_text(encoding="utf-8"))
@@ -177,10 +183,17 @@ class Store:
         for site in master.get("sites") or []:
             key = (site.get("key") or "").strip()
             api = (site.get("api") or "").strip()
+            if site.get("disabled"):
+                if key:
+                    self.disabled_keys.add(key)
+                continue
             if key and api.startswith(("http://", "https://")):
                 self.site_targets[key] = api
         for index, live in enumerate(master.get("lives") or []):
             url = (live.get("url") or "").strip()
+            if live.get("disabled"):
+                self.disabled_keys.add(f"live{index}")
+                continue
             if url.startswith(("http://", "https://")):
                 self.live_targets[f"live{index}"] = url
 
@@ -664,6 +677,10 @@ class Handler(BaseHTTPRequestHandler):
             reason = "account expired on " + (record.get("expires") or "") if state == "expired" else "account disabled"
             return self.respond(403, reason.encode(), ctype="text/plain")
         key = key.strip("/")
+        if key in self.store.disabled_keys:
+            # Switched off on purpose (dead list, duplicate, or pure bandwidth waste).
+            self.note(200, name, 0, {"disabled": True})
+            return self.respond(200, b"", headers={"X-Disabled": "1"}, ctype="text/plain; charset=utf-8")
         target = self.store.source_target(key)
         if not target:
             self.note(404, name)

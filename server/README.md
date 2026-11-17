@@ -161,10 +161,12 @@ su -s /bin/sh -c 'GOMOVIE_SYNC_ROOT=/var/lib/gomovie-sync \
 
 再想省，按性价比排：
 
-1. **删掉用不上的直播源**——10 条里通常只用 2~3 条，删掉最大那几条直接省 60%
-2. 调大 `gateway_live_cache_ttl`（默认 300 秒 → 3600），减少回源次数（省的是上游带宽，不是用户流量）
+1. **停用没用的源**——在 `private/sources.json` 里给该条加 `"disabled": true`。网关会回答 200 + 空内容（客户端不报错，只是没有频道），`make_client_config.py` 生成新配置时也会把它们剔除。适合：死链、重复、纯垃圾列表
+2. 调大 `gateway_live_cache_ttl`（默认 300 秒 → 3600），减少回源次数
 3. 剔除返回巨大 JSON 的站点（例如 `agg00` 单次 247 KB）
 4. 不要用 Cloudflare 缓存 `/g/` 的响应——那会让到期账号在缓存期内继续可用，得不偿失
+
+已按此停用 5 条直播列表（英文频道 679 KB、垃圾 txt 664 KB、两条死链、一条与 live2 完全重复），live 页一次完整拉取从约 1.9 MB 原始 / 300 KB 压缩降到 **73 KB**。想恢复：把 `disabled` 删掉、重启服务、重新生成配置。
 
 ## 在 app 里配置
 

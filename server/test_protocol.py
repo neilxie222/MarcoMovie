@@ -267,8 +267,14 @@ def main():
     priv = store.root / "private"
     priv.mkdir(parents=True, exist_ok=True)
     (priv / "sources.json").write_text(json.dumps({
-        "sites": [{"key": "demo", "api": f"http://127.0.0.1:{up_port}/api.php/provide/vod"}],
-        "lives": [{"url": f"http://127.0.0.1:{up_port}/live.txt"}],
+        "sites": [
+            {"key": "demo", "api": f"http://127.0.0.1:{up_port}/api.php/provide/vod"},
+            {"key": "offsite", "api": f"http://127.0.0.1:{up_port}/off", "disabled": True},
+        ],
+        "lives": [
+            {"url": f"http://127.0.0.1:{up_port}/live.txt"},
+            {"url": f"http://127.0.0.1:{up_port}/live2.txt", "disabled": True},
+        ],
     }), encoding="utf-8")
     store.load_sources()
 
@@ -342,6 +348,13 @@ def main():
     store.limiter.capacity = 120.0
     store.limiter.rate = 2.0
     store.limiter.buckets.clear()
+
+    print("disabled sources")
+    status, headers, body = request(port, "GET", f"/g/{token}/live1")
+    check("disabled live list -> empty 200", (status, body), (200, b""))
+    check("disabled entry is marked", headers.get("X-Disabled"), "1")
+    check("disabled site is not proxied", request(port, "GET", f"/g/{token}/offsite?ac=list")[2], b"")
+    check("disabling does not break the live neighbours", request(port, "GET", f"/g/{token}/live0")[0], 200)
     upstream.shutdown()
 
     print("client config generation")
@@ -356,6 +369,9 @@ def main():
     cfg_text = generated.read_text(encoding="utf-8") if generated.is_file() else "{}"
     check("generated config routes sites through the gateway", "/g/" in cfg_text, True)
     check("generated config hides the real upstream", "127.0.0.1" not in cfg_text, True)
+    parsed_cfg = json.loads(cfg_text)
+    check("disabled site left out of the config", [s["key"] for s in parsed_cfg["sites"]], ["demo"])
+    check("disabled live left out of the config", len(parsed_cfg["lives"]), 1)
     check("generator refuses unknown account", subprocess.run(
         [sys.executable, str(gen), "ghost"], capture_output=True, env=env, timeout=60).returncode, 1)
 

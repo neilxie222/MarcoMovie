@@ -41,15 +41,27 @@ def main(argv: list[str]) -> int:
     token = store.token_for(account)
     rewrote = 0
 
+    kept_sites = []
     for site in master.get("sites") or []:
+        if site.get("disabled"):
+            continue
         key = (site.get("key") or "").strip()
         if key:
             site["api"] = f"{public_url}/g/{token}/{key}"
             rewrote += 1
+        kept_sites.append(site)
+    master["sites"] = kept_sites
+
+    # Keep each live list's original index: the gateway path is /g/<token>/live<index>.
+    kept_lives = []
     for index, live in enumerate(master.get("lives") or []):
+        if live.get("disabled"):
+            continue
         if (live.get("url") or "").startswith(("http://", "https://")):
             live["url"] = f"{public_url}/g/{token}/live{index}"
             rewrote += 1
+        kept_lives.append(live)
+    master["lives"] = kept_lives
 
     out = root / "public" / f"{account}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
