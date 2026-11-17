@@ -9,6 +9,7 @@ engine cannot tell the difference between this server and Nextcloud.
 """
 import http.client
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -237,6 +238,65 @@ def main():
         port, "POST", "/admin/config-save", body="csrf=" + csrf + "&name=tvbox-demo.json&content=" + urllib.parse.quote("[1,2"),
         headers=form_headers)[0], 302)
     check("config untouched after refused save", request(port, "GET", "/config/tvbox-demo.json")[2], cfg.encode())
+
+    print("gateway: config points at us, expiry closes it")
+    import http.server as hs
+
+    class Upstream(hs.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            body = json.dumps({"upstream": True, "path": self.path}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    upstream = hs.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    upstream.daemon_threads = True
+    up_port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+
+    priv = store.root / "private"
+    priv.mkdir(parents=True, exist_ok=True)
+    (priv / "sources.json").write_text(json.dumps({
+        "sites": [{"key": "demo", "api": f"http://127.0.0.1:{up_port}/api.php/provide/vod"}],
+        "lives": [{"url": f"http://127.0.0.1:{up_port}/live.txt"}],
+    }), encoding="utf-8")
+    store.load_sources()
+
+    token = store.token_for("tablet")
+    lapsed = store.device("lapsed")
+    lapsed["expires"] = past  # re-expire it: the panel test above extended it
+    store.save_devices()
+    expired_token = store.token_for("lapsed")
+
+    status, _, body = request(port, "GET", f"/g/{token}/demo?ac=videolist&t=1&pg=2")
+    check("gateway proxies a site call -> 200", status, 200)
+    check("gateway forwards the query", b"ac=videolist" in body and b"pg=2" in body, True)
+    check("gateway proxies a live list -> 200", request(port, "GET", f"/g/{token}/live0")[0], 200)
+    check("expired token -> 403", request(port, "GET", f"/g/{expired_token}/demo?ac=list")[0], 403)
+    check("unknown token -> 403", request(port, "GET", "/g/deadbeef/demo?ac=list")[0], 403)
+    check("unknown source key -> 404", request(port, "GET", f"/g/{token}/nope?ac=list")[0], 404)
+    check("gateway never exposes the upstream host", b"127.0.0.1" not in request(port, "GET", f"/g/{token}/missing")[2], True)
+    upstream.shutdown()
+
+    print("client config generation")
+    gen = Path(__file__).resolve().parent / "make_client_config.py"
+    import subprocess
+
+    env = dict(os.environ, GOMOVIE_SYNC_ROOT=str(store.root))
+    proc = subprocess.run([sys.executable, str(gen), "tablet"], capture_output=True, env=env, timeout=60)
+    check("generator exits 0", proc.returncode, 0)
+    generated = store.root / "public" / "tablet.json"
+    check("generator wrote the config", generated.is_file(), True)
+    cfg_text = generated.read_text(encoding="utf-8") if generated.is_file() else "{}"
+    check("generated config routes sites through the gateway", "/g/" in cfg_text, True)
+    check("generated config hides the real upstream", "127.0.0.1" not in cfg_text, True)
+    check("generator refuses unknown account", subprocess.run(
+        [sys.executable, str(gen), "ghost"], capture_output=True, env=env, timeout=60).returncode, 1)
 
     print("logging")
     entries = store.recent_log(500)

@@ -28,7 +28,9 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +56,10 @@ class Store:
         self.config = self._load_json(root / "config.json", None)
         self.devices = self._load_json(root / "devices.json", {"devices": {}})
         self.state = self._load_json(root / "state.json", {"devices": {}, "spaces": {}})
+        self.site_targets: dict[str, str] = {}
+        self.live_targets: dict[str, str] = {}
+        self.load_sources()
+        self._devices_mtime = self._devices_mtime_now()
 
     # -- json helpers ------------------------------------------------------
     @staticmethod
@@ -74,6 +80,20 @@ class Store:
 
     def save_devices(self) -> None:
         self._save_json(self.root / "devices.json", self.devices)
+        self._devices_mtime = self._devices_mtime_now()
+
+    def _devices_mtime_now(self) -> float:
+        try:
+            return (self.root / "devices.json").stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _refresh_devices(self) -> None:
+        """Pick up devices.json edits made by other processes (e.g. make_client_config.py)."""
+        mtime = self._devices_mtime_now()
+        if mtime and mtime != self._devices_mtime:
+            self._devices_mtime = mtime
+            self.devices = self._load_json(self.root / "devices.json", {"devices": {}})
 
     def save_state(self) -> None:
         self._save_json(self.root / "state.json", self.state)
@@ -104,14 +124,61 @@ class Store:
         self.save_devices()
 
     def device(self, name: str):
+        self._refresh_devices()
         return self.devices["devices"].get(name)
 
     def device_by_password(self, user: str, password: str):
         """Match name+password only; enable/expiry policy lives in the request handler."""
+        self._refresh_devices()
         dev = self.devices["devices"].get(user)
         if not dev:
             return None
         return dev if verify_password(password, dev.get("hash", "")) else None
+
+    # -- gateway tokens ----------------------------------------------------
+    def token_for(self, name: str) -> str:
+        """Stable per-account token embedded in that account's generated config."""
+        rec = self.device(name)
+        if rec is None:
+            raise KeyError(name)
+        token = rec.get("token")
+        if not token:
+            token = secrets.token_hex(12)
+            rec["token"] = token
+            self.save_devices()
+        return token
+
+    def device_by_token(self, token: str):
+        if not token:
+            return None
+        self._refresh_devices()
+        for name, rec in self.devices["devices"].items():
+            if rec.get("token") and hmac.compare_digest(rec["token"], token):
+                return name, rec
+        return None
+
+    # -- upstream sources behind the gateway -------------------------------
+    def load_sources(self) -> None:
+        """Read ROOT/private/sources.json (the real, unpublished config) into key->url maps."""
+        self.site_targets = {}
+        self.live_targets = {}
+        path = self.root / "private" / "sources.json"
+        try:
+            master = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for site in master.get("sites") or []:
+            key = (site.get("key") or "").strip()
+            api = (site.get("api") or "").strip()
+            if key and api.startswith(("http://", "https://")):
+                self.site_targets[key] = api
+        for index, live in enumerate(master.get("lives") or []):
+            url = (live.get("url") or "").strip()
+            if url.startswith(("http://", "https://")):
+                self.live_targets[f"live{index}"] = url
+
+    def source_target(self, key: str) -> str:
+        return self.site_targets.get(key) or self.live_targets.get(key) or ""
 
     # -- payload versions --------------------------------------------------
     def snapshot(self, space: str, content: bytes) -> None:
@@ -219,6 +286,16 @@ def expiry_state(expires: str) -> tuple[str, int]:
     if left < 0:
         return "expired", left
     return ("soon" if left <= 7 else "ok"), left
+
+
+def account_state(record: dict) -> str:
+    """"ok" when the account may be used, otherwise the reason to refuse it."""
+    if not record.get("enabled", True):
+        return "disabled"
+    expires = record.get("expires") or ""
+    if expires and expires < today_utc():
+        return "expired"
+    return "ok"
 
 
 def extend_expiry(current: str, days: int) -> str:
@@ -412,6 +489,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- routing -----------------------------------------------------------
     def do_GET(self):
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        if path.startswith("/g/"):
+            return self.gateway(path)
         if path.startswith("/config/"):
             return self.serve_config(path)
         if path.startswith("/dav/") or path.endswith(FILE_NAME):
@@ -465,6 +544,50 @@ class Handler(BaseHTTPRequestHandler):
             return self.admin("POST", path)
         self.drain()
         return self.respond(405)
+
+    # -- gateway: /g/<token>/<key>?<query> -> the real upstream API --------
+    GATEWAY_UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
+    GATEWAY_MAX = 8 * 1024 * 1024
+
+    def gateway(self, path: str) -> None:
+        """Proxy one upstream API call for an account, so expiry can actually revoke access.
+
+        The generated client config points every site (and live list) here; the account's token
+        decides whether the upstream is reached at all.
+        """
+        rest = path[len("/g/"):]
+        token, _, key = rest.partition("/")
+        hit = self.store.device_by_token(token)
+        if hit is None:
+            self.note(403, "gateway")
+            return self.respond(403, b"unknown token", ctype="text/plain")
+        name, record = hit
+        state = account_state(record)
+        if state != "ok":
+            self.note(403, name)
+            reason = "account expired on " + (record.get("expires") or "") if state == "expired" else "account disabled"
+            return self.respond(403, reason.encode(), ctype="text/plain")
+        target = self.store.source_target(key.strip("/"))
+        if not target:
+            self.note(404, name)
+            return self.respond(404, b"unknown source key", ctype="text/plain")
+        query = urllib.parse.urlsplit(self.path).query
+        url = target + (("&" if "?" in target else "?") + query if query else "")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": self.GATEWAY_UA, "Accept-Encoding": "identity"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read(self.GATEWAY_MAX)
+                status = resp.status
+                ctype = resp.headers.get("Content-Type") or "application/json; charset=utf-8"
+        except urllib.error.HTTPError as exc:
+            body = exc.read(self.GATEWAY_MAX)
+            status = exc.code
+            ctype = exc.headers.get("Content-Type") or "text/plain"
+        except Exception:  # timeouts, DNS, TLS: never leak the upstream host in the response
+            self.note(502, name)
+            return self.respond(502, b"upstream unreachable", ctype="text/plain")
+        self.note(status, name, len(body))
+        return self.respond(status, body, headers={"Cache-Control": "no-store"}, ctype=ctype)
 
     # -- static config files (app "导入配置地址" targets) -------------------
     def serve_config(self, path: str) -> None:
@@ -568,12 +691,13 @@ class Handler(BaseHTTPRequestHandler):
             self.note(403, user)
             self.respond(403, b"account disabled", ctype="text/plain")
             return None
-        expires = record.get("expires") or ""
-        if expires and expires < today_utc():
+        state = account_state(record)
+        if state == "expired":
             # Expired on purpose, not a bad password: say so in the body and in the log.
             self.drain()
             self.note(403, user)
-            self.respond(403, b"account expired on " + expires.encode(), ctype="text/plain")
+            expires = (record.get("expires") or "").encode()
+            self.respond(403, b"account expired on " + expires, ctype="text/plain")
             return None
         return user, record
 

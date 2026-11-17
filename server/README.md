@@ -16,18 +16,21 @@
 
 ```
 server/
-  gomovie_sync.py       服务本体（Python 3.11+，标准库）
-  test_protocol.py      自检：按客户端真实时序重放一遍，全绿才算没坏
-  gomovie-sync.service  systemd 单元（就地监听 :80，非 root 用户）
-  README.md             本文件
+  gomovie_sync.py          服务本体（Python 3.11+，标准库）
+  make_client_config.py    按账号生成客户端配置（所有源指向网关）
+  test_protocol.py         自检：按客户端真实时序重放一遍，全绿才算没坏
+  gomovie-sync.service     systemd 单元（就地监听 :80，非 root 用户）
+  README.md                本文件
 ```
 
 数据都在一个目录里（默认 `/var/lib/gomovie-sync`）：
 
 ```
 config.json      secret、管理员密码哈希、public_url、保留策略
-devices.json     账号 → 空间 / 密码哈希 / 启停 / 到期日 / 备注
+devices.json     账号 → 空间 / 密码哈希 / 启停 / 到期日 / 备注 / 网关 token
 state.json       每个账号最后读取 / 最后写入时间
+private/sources.json                       真实接口地址（母版，绝不公开）
+public/<账号>.json                         app 导入用的配置：源地址全指向网关
 data/<空间>/marco-movie-sync.json          当前同步数据
 data/<空间>/versions/<时间戳>.json         历史版本
 public/<名字>.json                         app「导入配置地址」用的公开配置
@@ -78,6 +81,37 @@ sync.example.com {
 ```
 
 Caddy 自动签证书。两条路服务端代码都不用改。
+
+## 网关：让「到期」真的能停用，而不只是停同步
+
+客户端的配置是**导入一次、永久本地生效**的（`SourceController.fetchImport` 只在导入时请求一次）。所以只要配置里写的是真实接口地址，账号到期、后台删订阅都拦不住已经导入的人。
+
+做法是配置里**永远不出现真实接口**：
+
+```
+config 里的 api:  https://sync.example.com/g/<该账号 token>/ffzy
+                            ↓ 客户端照常带 ?ac=videolist&t=1&pg=1
+服务端 /g/ 路由:   验 token → 查账号是否过期/停用 → 转发到真实 api → 原样返回 JSON
+```
+
+到期或停用后，网关直接回 403：首页列表、分类、搜索、详情全部断掉，客户端里那份缓存配置就废了。
+
+生成配置（每个账号一份，token 不同）：
+
+```bash
+su -s /bin/sh -c 'GOMOVIE_SYNC_ROOT=/var/lib/gomovie-sync \
+  python3 /opt/gomovie-sync/make_client_config.py kpad' gomovie
+# 输出：已生成 …/public/kpad.json (34 条地址指向网关)
+#       app 里填: https://sync.example.com/config/kpad.json
+```
+
+真实接口放在 `private/sources.json`（不对外提供），改完源要重启服务让网关重新加载。
+
+**边界**（重要）：
+- 已经拿到的**播放直链（m3u8）**仍能播那一条，网关拦不到；拦的是“继续浏览/搜索/拿新集”
+- 懂技术的人抓包能看到真实源域名，理论上能自己重建配置——这是提高门槛，不是加密锁
+- 网关是你的单点：服务挂了所有人都用不了（配置地址本来也在同一台机器上）
+- 十几到几十人的量够用；要再上量需要加每账号限流和热门列表短缓存
 
 ## 在 app 里配置
 
