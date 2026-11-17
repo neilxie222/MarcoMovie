@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -243,11 +244,14 @@ def main():
     import http.server as hs
 
     class Upstream(hs.BaseHTTPRequestHandler):
+        calls = 0
+
         def log_message(self, *args):
             pass
 
         def do_GET(self):
-            body = json.dumps({"upstream": True, "path": self.path}).encode()
+            Upstream.calls += 1
+            body = json.dumps({"upstream": True, "path": self.path, "call": Upstream.calls}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -281,6 +285,47 @@ def main():
     check("unknown token -> 403", request(port, "GET", "/g/deadbeef/demo?ac=list")[0], 403)
     check("unknown source key -> 404", request(port, "GET", f"/g/{token}/nope?ac=list")[0], 404)
     check("gateway never exposes the upstream host", b"127.0.0.1" not in request(port, "GET", f"/g/{token}/missing")[2], True)
+
+    print("gateway cache")
+    Upstream.calls = 0
+    store.cache.items.clear()
+    store.cache.bytes = 0
+    first = request(port, "GET", f"/g/{token}/demo?ac=list&pg=1")
+    second = request(port, "GET", f"/g/{token}/demo?ac=list&pg=1")
+    check("identical requests hit the upstream once", Upstream.calls, 1)
+    check("cached response is byte-identical", first[2], second[2])
+    check("second response marked as a cache hit", second[1].get("X-Cache"), "hit")
+    request(port, "GET", f"/g/{token}/demo?ac=list&pg=2")
+    check("different query is a separate entry", Upstream.calls, 2)
+    check("expired account cannot read a warm cache", request(port, "GET", f"/g/{expired_token}/demo?ac=list&pg=1")[0], 403)
+    store.cache_ttl = 0.3
+    store.cache.items.clear()
+    store.cache.bytes = 0
+    before = Upstream.calls
+    request(port, "GET", f"/g/{token}/demo?ac=list&pg=1")   # miss, stored with the 0.3s TTL
+    request(port, "GET", f"/g/{token}/demo?ac=list&pg=1")   # hit
+    time.sleep(0.5)
+    request(port, "GET", f"/g/{token}/demo?ac=list&pg=1")   # expired -> miss again
+    check("cache entry expires after its TTL", Upstream.calls - before, 2)
+    store.cache_ttl = 30
+    check("live lists use their own longer TTL", store.live_cache_ttl > store.cache_ttl, True)
+    check("errors are never cached", request(port, "GET", f"/g/{token}/nope?ac=list")[0], 404)
+
+    print("gateway rate limit")
+    store.add_device("burst", "default", "pw-burst")
+    burst_token = store.token_for("burst")
+    store.limiter.capacity = 3.0
+    store.limiter.rate = 3.0 / 60.0
+    store.limiter.buckets.clear()
+    codes = [request(port, "GET", f"/g/{burst_token}/demo?ac=list&pg={i}")[0] for i in range(5)]
+    check("bucket allows the first three", codes[:3], [200, 200, 200])
+    check("then answers 429", codes[3:], [429, 429])
+    status, headers, _ = request(port, "GET", f"/g/{burst_token}/demo?ac=list&pg=9")
+    check("429 carries Retry-After", int(headers.get("Retry-After", "0")) > 0, True)
+    check("other accounts keep their own bucket", request(port, "GET", f"/g/{token}/demo?ac=list&pg=7")[0], 200)
+    store.limiter.capacity = 120.0
+    store.limiter.rate = 2.0
+    store.limiter.buckets.clear()
     upstream.shutdown()
 
     print("client config generation")

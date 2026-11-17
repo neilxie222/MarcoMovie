@@ -60,6 +60,11 @@ class Store:
         self.live_targets: dict[str, str] = {}
         self.load_sources()
         self._devices_mtime = self._devices_mtime_now()
+        cfg = self.config or {}
+        self.cache = GatewayCache(int(cfg.get("gateway_cache_bytes", 64 * 1024 * 1024)))
+        self.limiter = RateLimiter(int(cfg.get("gateway_rate_per_min", 120)))
+        self.cache_ttl = float(cfg.get("gateway_cache_ttl", 30))
+        self.live_cache_ttl = float(cfg.get("gateway_live_cache_ttl", 300))
 
     # -- json helpers ------------------------------------------------------
     @staticmethod
@@ -316,6 +321,82 @@ def space_lock(space: str) -> threading.Lock:
         return LOCKS.setdefault(space, threading.Lock())
 
 
+class GatewayCache:
+    """Small in-process response cache in front of the upstreams.
+
+    Keys are `<source key>?<query>`; identical requests from different accounts share one entry
+    because the upstream payload does not depend on who asked. Only 200 responses are stored —
+    errors must reach the client so an expiry or upstream outage is never masked by a stale hit.
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max(1024 * 1024, max_bytes)
+        self.items: dict[str, tuple[float, int, str, bytes]] = {}
+        self.bytes = 0
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> tuple[int, str, bytes] | None:
+        now = time.time()
+        with self.lock:
+            entry = self.items.get(key)
+            if entry is None or entry[0] < now:
+                if entry is not None:
+                    self.bytes -= len(entry[3])
+                    self.items.pop(key, None)
+                self.misses += 1
+                return None
+            self.hits += 1
+            return entry[1], entry[2], entry[3]
+
+    def put(self, key: str, ttl: float, status: int, ctype: str, body: bytes) -> None:
+        if ttl <= 0 or status != 200 or len(body) > self.max_bytes // 4:
+            return
+        now = time.time()
+        with self.lock:
+            old = self.items.pop(key, None)
+            if old is not None:
+                self.bytes -= len(old[3])
+            while self.bytes + len(body) > self.max_bytes and self.items:
+                victim = min(self.items.items(), key=lambda kv: kv[1][0])[0]
+                self.bytes -= len(self.items.pop(victim)[3])
+            self.items[key] = (now + ttl, status, ctype, body)
+            self.bytes += len(body)
+
+    def stats(self) -> dict:
+        with self.lock:
+            return {"hits": self.hits, "misses": self.misses, "entries": len(self.items), "bytes": self.bytes}
+
+
+class RateLimiter:
+    """Token bucket per account: `per_minute` sustained, the same number as a burst ceiling."""
+
+    def __init__(self, per_minute: int):
+        self.capacity = float(max(5, per_minute))
+        self.rate = self.capacity / 60.0
+        self.buckets: dict[str, tuple[float, float]] = {}
+        self.lock = threading.Lock()
+        self.limited = 0
+
+    def allow(self, name: str) -> bool:
+        now = time.time()
+        with self.lock:
+            tokens, last = self.buckets.get(name, (self.capacity, now))
+            tokens = min(self.capacity, tokens + (now - last) * self.rate)
+            if tokens < 1.0:
+                self.buckets[name] = (tokens, now)
+                self.limited += 1
+                return False
+            self.buckets[name] = (tokens - 1.0, now)
+            return True
+
+    def retry_after(self, name: str) -> int:
+        with self.lock:
+            tokens, _ = self.buckets.get(name, (0.0, 0.0))
+        return max(1, int((1.0 - tokens) / self.rate) + 1)
+
+
 def etag_of(content: bytes) -> str:
     return '"' + hashlib.sha256(content).hexdigest()[:32] + '"'
 
@@ -472,19 +553,20 @@ class Handler(BaseHTTPRequestHandler):
             data += chunk
         return data
 
-    def note(self, status: int, device: str, size: int = 0) -> None:
-        self.store.log(
-            {
-                "ts": utc_iso(),
-                "ip": self.client_ip(),
-                "device": device,
-                "method": self.command,
-                "path": self.path,
-                "status": status,
-                "bytes": size,
-                "ua": self.headers.get("User-Agent", ""),
-            }
-        )
+    def note(self, status: int, device: str, size: int = 0, extra: dict | None = None) -> None:
+        entry = {
+            "ts": utc_iso(),
+            "ip": self.client_ip(),
+            "device": device,
+            "method": self.command,
+            "path": self.path,
+            "status": status,
+            "bytes": size,
+            "ua": self.headers.get("User-Agent", ""),
+        }
+        if extra:
+            entry.update(extra)
+        self.store.log(entry)
 
     # -- routing -----------------------------------------------------------
     def do_GET(self):
@@ -567,11 +649,27 @@ class Handler(BaseHTTPRequestHandler):
             self.note(403, name)
             reason = "account expired on " + (record.get("expires") or "") if state == "expired" else "account disabled"
             return self.respond(403, reason.encode(), ctype="text/plain")
-        target = self.store.source_target(key.strip("/"))
+        key = key.strip("/")
+        target = self.store.source_target(key)
         if not target:
             self.note(404, name)
             return self.respond(404, b"unknown source key", ctype="text/plain")
+        if not self.store.limiter.allow(name):
+            wait = self.store.limiter.retry_after(name)
+            self.note(429, name, extra={"limited": True})
+            return self.respond(
+                429,
+                b"too many requests, retry in %ds" % wait,
+                headers={"Retry-After": str(wait)},
+                ctype="text/plain",
+            )
         query = urllib.parse.urlsplit(self.path).query
+        cache_key = key + "?" + query
+        cached = self.store.cache.get(cache_key)
+        if cached is not None:
+            status, ctype, body = cached
+            self.note(status, name, len(body), {"cache": "hit"})
+            return self.respond(status, body, headers={"Cache-Control": "no-store", "X-Cache": "hit"}, ctype=ctype)
         url = target + (("&" if "?" in target else "?") + query if query else "")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": self.GATEWAY_UA, "Accept-Encoding": "identity"})
@@ -586,8 +684,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # timeouts, DNS, TLS: never leak the upstream host in the response
             self.note(502, name)
             return self.respond(502, b"upstream unreachable", ctype="text/plain")
-        self.note(status, name, len(body))
-        return self.respond(status, body, headers={"Cache-Control": "no-store"}, ctype=ctype)
+        ttl = self.store.live_cache_ttl if key.startswith("live") else self.store.cache_ttl
+        self.store.cache.put(cache_key, ttl, status, ctype, body)
+        self.note(status, name, len(body), {"cache": "miss"})
+        return self.respond(status, body, headers={"Cache-Control": "no-store", "X-Cache": "miss"}, ctype=ctype)
 
     # -- static config files (app "导入配置地址" targets) -------------------
     def serve_config(self, path: str) -> None:
@@ -1231,6 +1331,7 @@ class Handler(BaseHTTPRequestHandler):
             self.flash(query)
             + f"<div class=cards>{card_html}</div>"
             + f"<h2>空间 {html.escape(space)} 的内容</h2><div class=card>{self.payload_summary(space)}</div>"
+            + self.gateway_summary()
             + "<h2>账号</h2>" + table
             + add_form
             + "<h2>安全</h2><div class=card><form method=post action=/admin/admin-passwd class=row>"
@@ -1238,6 +1339,21 @@ class Handler(BaseHTTPRequestHandler):
             "<div style='flex:1;min-width:240px'><input type=password name=password placeholder='新的管理员密码（至少 10 位）'></div>"
             "<div><button class=ghost>改管理员密码</button></div></form>"
             "<p class=muted style='margin:12px 0 0'>只影响面板登录；设备同步用的是各自的账号密码。</p></div>"
+        )
+
+    def gateway_summary(self) -> str:
+        cache = self.store.cache.stats()
+        total = cache["hits"] + cache["misses"]
+        pct = f"{cache['hits'] * 100 // total}%" if total else "—"
+        limiter = self.store.limiter
+        return (
+            "<div class=card style='margin-top:14px'>"
+            f"<div class=muted>网关自上次重启：命中 <b>{cache['hits']}</b> · 未命中 <b>{cache['misses']}</b>"
+            f"（命中率 {pct}）· 限流拒绝 <b>{limiter.limited}</b> 次 · "
+            f"缓存 {cache['entries']} 条 / {fmt_size(cache['bytes'])}</div>"
+            f"<div class=muted style='margin-top:6px'>每账号 {int(limiter.capacity)} 次/分钟；"
+            f"站点列表缓存 {int(self.store.cache_ttl)} 秒，直播列表 {int(self.store.live_cache_ttl)} 秒。"
+            "改这些值：config.json 里的 gateway_* 字段，改完重启服务。</div></div>"
         )
 
     def current_size(self, space: str) -> str:
@@ -1340,6 +1456,10 @@ def init_store(root: Path, public_url: str) -> Store:
             "max_bytes": 8 * 1024 * 1024,
             "max_versions": 50,
             "retention_days": 30,
+            "gateway_rate_per_min": 120,
+            "gateway_cache_ttl": 30,
+            "gateway_live_cache_ttl": 300,
+            "gateway_cache_bytes": 64 * 1024 * 1024,
         }
         store.save_config()
         print("=" * 62)
