@@ -399,6 +399,10 @@ def main():
     check("detail page shows the url", "/dav/default/marco-movie-sync.json" in page_html, True)
     check("detail page shows the password", "pw-tv" in page_html, True)
     check("detail page shows expiry", "到期" in page_html, True)
+    dav_url_hint = "https://sync.example.test/dav/default/marco-movie-sync.json"
+    check("detail page has setup steps", "使用说明" in page_html and "配置 WebDAV" in page_html, True)
+    check("detail page has a copyable handover block", 'id=share' in page_html and dav_url_hint in page_html, True)
+    check("handover block carries the password", "pw-tv" in page_html, True)
     legacy_html = request(port, "GET", "/admin/account?name=oldbox", headers={"Cookie": cookie})[2].decode()
     check("legacy account page explains it cannot be shown", "不可恢复" in legacy_html, True)
     check("unknown account page says so", "账号不存在" in request(

@@ -1338,10 +1338,47 @@ class Handler(BaseHTTPRequestHandler):
             "<button class=ghost>启/停</button></form> "
             "<a class=btn href='/admin'>返回概览</a></div>"
         )
+        expiry_line = "有效期：永久" if not expires else f"有效期：{expires}（过期后该账号失效，需续期）"
+        invite = (
+            "Gomovie 播放器配置\n"
+            "\n"
+            "① 先导入配置源（首页 →「＋ 导入我的配置」或 设置 → 订阅与账号 → 导入或更新影视订阅）\n"
+            f"   配置地址：{config_url or '（尚未生成，请联系管理员）'}\n"
+            "\n"
+            "② 再打开多端同步（设置 → 数据 → 多端网络同步 → 配置 WebDAV）\n"
+            f"   同步地址：{dav_url}\n"
+            f"   账号：{name}\n"
+            f"   密码：{password or '（请向管理员索取）'}\n"
+            "\n"
+            f"{expiry_line}\n"
+            "填完点「保存并立即 WebDAV 云同步」，之后观看进度、收藏、订阅源会自动同步。\n"
+        )
+        steps = (
+            "<h2>使用说明</h2><div class=card><ol style='margin:0;padding-left:22px;line-height:1.9'>"
+            "<li>装好 app 后，先在首页点「＋ 导入我的配置」（手机上也可走 设置 → 订阅与账号 → 导入或更新影视订阅），"
+            f"把配置地址 <code>{html.escape(config_url or '（尚未生成）')}</code> 粘进去点导入 —— 这一步是给片源。</li>"
+            "<li>设置 → 数据 → 多端网络同步 → 配置 WebDAV，填<b>同步地址、账号、密码</b>三项，"
+            "点「保存并立即 WebDAV 云同步」——这一步是同步观看进度和收藏。</li>"
+            "<li>之后换设备只要重复第 1、2 步；同一账号在多个设备登录会互相同步。</li>"
+            "<li>到期后该账号的地址会返回 403，app 会提示「来源返回 HTTP 403」，续期后点重试即可恢复。</li>"
+            "</ol></div>"
+        )
+        copy_card = (
+            "<h2>复制给用户</h2><div class=card>"
+            "<textarea id=share readonly spellcheck=false style='width:100%;min-height:230px;background:#16161a;"
+            "color:#e8e8ee;border:1px solid #31313a;border-radius:12px;padding:12px;font-family:ui-monospace,"
+            f"Consolas,monospace;font-size:13px;line-height:1.6'>{html.escape(invite)}</textarea>"
+            "<div class=row style='margin-top:12px'>"
+            "<button onclick=\"navigator.clipboard.writeText(document.getElementById('share').value)"
+            ".then(()=>{this.textContent='已复制 ✓'})\">复制这段文字</button>"
+            "<span class=muted>直接粘到微信/QQ 发给用户即可</span></div></div>"
+        )
         return (
             self.flash(query)
             + f"<h2>账号 <code>{html.escape(name)}</code></h2>"
             + f"<div class=card><table>{table}</table>{actions}</div>"
+            + steps
+            + copy_card
             + "<p class=muted>密码存在服务器上、用 config.json 里的 secret 加密保存；"
             "备份目录时别把 secret 和 devices.json 分开丢，否则密码无法还原。</p>"
         )
