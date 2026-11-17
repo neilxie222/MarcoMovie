@@ -120,15 +120,30 @@ class Store:
         return sorted(d.name for d in self.data.iterdir() if d.is_dir() and not d.name.startswith("."))
 
     # -- devices -----------------------------------------------------------
+    def remember_password(self, record: dict, plain: str) -> None:
+        """Keep the scrypt hash for auth plus a reversible copy for the admin panel."""
+        record["hash"] = hash_password(plain)
+        record["pass_enc"] = encrypt_secret((self.config or {}).get("secret", ""), plain)
+
+    def reveal_password(self, record: dict) -> str:
+        token = record.get("pass_enc")
+        if not token:
+            return ""
+        try:
+            return decrypt_secret((self.config or {}).get("secret", ""), token)
+        except Exception:
+            return ""
+
     def add_device(self, name: str, space: str, password: str, expires: str = "", note: str = "") -> None:
-        self.devices["devices"][name] = {
+        record = {
             "space": space,
-            "hash": hash_password(password),
             "enabled": True,
             "created": utc_iso(),
             "expires": expires,  # "" = never expires; otherwise a YYYY-MM-DD day (UTC, inclusive)
             "note": note,
         }
+        self.remember_password(record, password)
+        self.devices["devices"][name] = record
         self.save_devices()
 
     def device(self, name: str):
@@ -274,7 +289,7 @@ class Store:
         return out
 
     # -- per-device touch bookkeeping --------------------------------------
-    def touch(self, device: str, space: str, action: str, size: int = 0) -> None:
+    def touch(self, device: str, space: str, action: str, size: int = 0, ip: str = "", ua: str = "") -> None:
         now = utc_iso()
         with STATE_GUARD:
             rec = self.state["devices"].setdefault(device, {})
@@ -282,6 +297,10 @@ class Store:
             rec[f"last_{action}"] = now
             if size:
                 rec["size"] = size
+            if ip:
+                rec["last_ip"] = ip
+            if ua:
+                rec["last_ua"] = ua
             self.state["spaces"][space] = {"updated": now, "size": size or rec.get("size", 0)}
             self.save_state()
 
@@ -426,6 +445,47 @@ def gzip_bytes(data: bytes, level: int = 6) -> bytes:
     with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=level) as gz:
         gz.write(data)
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- credential vault
+
+
+def _credential_key(secret_hex: str) -> bytes:
+    return hmac.new(secret_hex.encode(), b"gomovie-sync/credential-vault", hashlib.sha256).digest()
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out += hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest()
+        counter += 1
+    return bytes(out[:length])
+
+
+def encrypt_secret(secret_hex: str, plain: str) -> str:
+    """Reversible copy of an account password, keyed by config.json's secret.
+
+    The scrypt hash stays the source of truth for authentication; this exists so the admin panel
+    can show a forgotten password back to the operator.
+    """
+    key = _credential_key(secret_hex)
+    nonce = secrets.token_bytes(12)
+    data = plain.encode("utf-8")
+    cipher = bytes(a ^ b for a, b in zip(data, _keystream(key, nonce, len(data))))
+    tag = hmac.new(key, nonce + cipher, hashlib.sha256).digest()[:16]
+    return base64.b64encode(nonce + cipher + tag).decode("ascii")
+
+
+def decrypt_secret(secret_hex: str, token: str) -> str:
+    raw = base64.b64decode(token)
+    if len(raw) < 29:
+        raise ValueError("ciphertext too short")
+    nonce, cipher, tag = raw[:12], raw[12:-16], raw[-16:]
+    key = _credential_key(secret_hex)
+    if not hmac.compare_digest(tag, hmac.new(key, nonce + cipher, hashlib.sha256).digest()[:16]):
+        raise ValueError("bad tag")
+    return bytes(a ^ b for a, b in zip(cipher, _keystream(key, nonce, len(cipher)))).decode("utf-8")
 
 
 # --------------------------------------------------------------------------- passwords
@@ -863,7 +923,7 @@ class Handler(BaseHTTPRequestHandler):
             content = target.read_bytes()
             etag = etag_of(content)
             self.note(200, device, len(content))
-            self.store.touch(device, space, "get", len(content))
+            self.store.touch(device, space, "get", len(content), self.client_ip(), self.headers.get("User-Agent", ""))
             return self.respond(
                 200,
                 content,
@@ -922,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
                 os.replace(tmp, target)
 
         self.note(201 if current is None else 204, device, len(body))
-        self.store.touch(device, space, "put", len(body))
+        self.store.touch(device, space, "put", len(body), self.client_ip(), self.headers.get("User-Agent", ""))
         return self.respond(
             201 if current is None else 204,
             b"",
@@ -983,6 +1043,8 @@ class Handler(BaseHTTPRequestHandler):
         )
         if path == "/admin":
             return self.respond(200, page("Gomovie Sync", self.dashboard(query), nav), ctype="text/html; charset=utf-8")
+        if path == "/admin/account":
+            return self.respond(200, page("账号详情", self.account_page(query), nav), ctype="text/html; charset=utf-8")
         if path == "/admin/edit":
             return self.respond(200, page("编辑同步数据", self.edit_page(query), nav), ctype="text/html; charset=utf-8")
         if path == "/admin/configs":
@@ -1065,7 +1127,7 @@ class Handler(BaseHTTPRequestHandler):
             if not record:
                 return self.redirect("/admin", "账号不存在")
             password = generate_password()
-            record["hash"] = hash_password(password)
+            self.store.remember_password(record, password)
             self.store.save_devices()
             return self.respond(
                 200,
@@ -1213,6 +1275,77 @@ class Handler(BaseHTTPRequestHandler):
             "<p class=muted>在 app 里：设置 → 多端网络同步 → WebDAV，把上面三项填进去。</p>"
         )
 
+    def account_page(self, query: dict) -> str:
+        """Everything an operator needs to hand a device over: URL, login, password, expiry."""
+        name = query.get("name", [""])[0]
+        record = self.store.device(name)
+        if not record:
+            return f"<div class=flash>账号不存在：<code>{html.escape(name)}</code></div>"
+        space = record.get("space", "default")
+        dav_url = f"{self.public_url}/dav/{space}/{FILE_NAME}"
+        config_name = f"{name}.json"
+        config_path = self.store.root / "public" / config_name
+        config_url = (
+            f"{self.public_url}/config/{urllib.parse.quote(config_name)}"
+            if config_path.is_file()
+            else ""
+        )
+        password = self.store.reveal_password(record)
+        state = account_state(record)
+        kind, left = expiry_state(record.get("expires") or "")
+        badge = {
+            "ok": "<span class='pill ok'>可登录</span>",
+            "disabled": "<span class='pill off'>已停用</span>",
+            "expired": "<span class='pill off'>已到期</span>",
+        }[state]
+        expires = record.get("expires") or ""
+        expiry_text = "永久" if not expires else f"{expires}（{'已过期' if kind == 'expired' else f'剩 {left} 天'}）"
+        stat = self.store.state["devices"].get(name, {})
+        rows = [
+            ("同步地址（app 里填）", f"<code>{html.escape(dav_url)}</code>"),
+            ("账号", f"<code>{html.escape(name)}</code>"),
+            (
+                "密码",
+                f"<code>{html.escape(password)}</code>"
+                if password
+                else "<span class=muted>不可恢复（此账号建于加密功能之前），点「重置密码」生成新的</span>",
+            ),
+            ("配置文件（导入配置地址）", f"<code>{html.escape(config_url)}</code>" if config_url
+             else "<span class=muted>还没生成：跑一次 make_client_config.py</span>"),
+            ("空间", f"<code>{html.escape(space)}</code>"),
+            ("状态", badge),
+            ("到期", html.escape(expiry_text)),
+            ("备注", html.escape(record.get("note") or "—")),
+            ("创建时间", fmt_time(record.get("created", ""))),
+            ("最后读取", fmt_time(stat.get("last_get", ""))),
+            ("最后写入", fmt_time(stat.get("last_put", ""))),
+            ("最后连接 IP", html.escape(stat.get("last_ip") or "—")),
+            ("最后客户端", f"<span class=muted>{html.escape(stat.get('last_ua') or '—')}</span>"),
+        ]
+        table = "".join(
+            f"<tr><th style='width:210px'>{label}</th><td>{value}</td></tr>" for label, value in rows
+        )
+        actions = (
+            "<div class=row style='margin-top:14px'>"
+            f"<form class=inline method=post action=/admin/device-token>"
+            f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
+            "<button class=ghost>重置密码</button></form> "
+            f"<form class=inline method=post action=/admin/device-extend>"
+            f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
+            "<input type=hidden name=days value='30'><button class=ghost>+30 天</button></form> "
+            f"<form class=inline method=post action=/admin/device-toggle>"
+            f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
+            "<button class=ghost>启/停</button></form> "
+            "<a class=btn href='/admin'>返回概览</a></div>"
+        )
+        return (
+            self.flash(query)
+            + f"<h2>账号 <code>{html.escape(name)}</code></h2>"
+            + f"<div class=card><table>{table}</table>{actions}</div>"
+            + "<p class=muted>密码存在服务器上、用 config.json 里的 secret 加密保存；"
+            "备份目录时别把 secret 和 devices.json 分开丢，否则密码无法还原。</p>"
+        )
+
     def edit_page(self, query: dict) -> str:
         """Textarea editor for the synced payload of a space."""
         spaces = sorted(set(self.store.spaces()) | set(self.store.state["spaces"]) | {"default"})
@@ -1340,7 +1473,8 @@ class Handler(BaseHTTPRequestHandler):
                 + f"</td><td>{html.escape(rec['space'])}</td>"
                 f"<td>{badge}</td><td>{expiry_cell}</td><td>{fmt_time(res.get('last_get', ''))}</td>"
                 f"<td>{fmt_time(res.get('last_put', ''))}</td><td>{fmt_size(res.get('size', 0))}</td>"
-                "<td><form class=inline method=post action=/admin/device-token>"
+                "<td><a href='/admin/account?name=" + urllib.parse.quote(name) + "'>详情</a> "
+                "<form class=inline method=post action=/admin/device-token>"
                 f"<input type=hidden name=csrf value='{self.csrf()}'><input type=hidden name=name value='{html.escape(name)}'>"
                 "<button class='ghost'>重置密码</button></form> "
                 "<form class=inline method=post action=/admin/device-extend>"

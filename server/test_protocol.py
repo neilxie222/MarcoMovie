@@ -375,6 +375,47 @@ def main():
     check("generator refuses unknown account", subprocess.run(
         [sys.executable, str(gen), "ghost"], capture_output=True, env=env, timeout=60).returncode, 1)
 
+    print("credential vault and account detail page")
+    import base64 as b64
+
+    blob = gs.encrypt_secret("s" * 64, "p@ss-word 中文")
+    check("encrypt/decrypt round-trips", gs.decrypt_secret("s" * 64, blob), "p@ss-word 中文")
+    check("ciphertext hides the plaintext", b"p@ss" not in b64.b64decode(blob), True)
+    try:
+        gs.decrypt_secret("x" * 64, blob)
+        check("wrong secret is rejected", "no error", "ValueError")
+    except Exception:
+        check("wrong secret is rejected", True, True)
+
+    check("new account stores a reversible copy", bool(store.device("tv").get("pass_enc")), True)
+    check("revealed password matches", store.reveal_password(store.device("tv")), "pw-tv")
+    store.add_device("oldbox", "default", "pw-old")
+    legacy = store.device("oldbox")
+    legacy.pop("pass_enc", None)  # pretend it predates the vault
+    store.save_devices()
+    check("legacy account reveals nothing", store.reveal_password(store.device("oldbox")), "")
+
+    page_html = request(port, "GET", "/admin/account?name=tv", headers={"Cookie": cookie})[2].decode()
+    check("detail page shows the url", "/dav/default/marco-movie-sync.json" in page_html, True)
+    check("detail page shows the password", "pw-tv" in page_html, True)
+    check("detail page shows expiry", "到期" in page_html, True)
+    legacy_html = request(port, "GET", "/admin/account?name=oldbox", headers={"Cookie": cookie})[2].decode()
+    check("legacy account page explains it cannot be shown", "不可恢复" in legacy_html, True)
+    check("unknown account page says so", "账号不存在" in request(
+        port, "GET", "/admin/account?name=ghost", headers={"Cookie": cookie})[2].decode(), True)
+
+    status, headers, body = request(port, "POST", "/admin/device-token",
+                                    body=f"csrf={csrf}&name=tv", headers=form_headers)
+    check("reset password page shows the new one", "pw-" in body.decode() or "密码" in body.decode(), True)
+    new_pw = store.reveal_password(store.device("tv"))
+    check("reset password stored a fresh reversible copy", new_pw != "pw-tv", True)
+    check("new password authenticates", request(port, "GET", url, auth=("tv", new_pw))[0], 200)
+
+    request(port, "GET", url, auth=("tv", new_pw), headers={"User-Agent": "MarcoMovie-Sync/2.0"})
+    state = store.state["devices"].get("tv", {})
+    check("last client IP recorded", bool(state.get("last_ip")), True)
+    check("last client UA recorded", state.get("last_ua"), "MarcoMovie-Sync/2.0")
+
     print("logging")
     entries = store.recent_log(500)
     methods = {e["method"] for e in entries}
