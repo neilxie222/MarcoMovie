@@ -18,9 +18,11 @@ logs every request. Standard library only; no database.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import hmac
 import html
+import io
 import json
 import os
 import re
@@ -331,38 +333,43 @@ class GatewayCache:
 
     def __init__(self, max_bytes: int):
         self.max_bytes = max(1024 * 1024, max_bytes)
-        self.items: dict[str, tuple[float, int, str, bytes]] = {}
+        # key -> (expires_at, status, ctype, raw body, gzipped body or b"")
+        self.items: dict[str, tuple[float, int, str, bytes, bytes]] = {}
         self.bytes = 0
         self.lock = threading.Lock()
         self.hits = 0
         self.misses = 0
 
-    def get(self, key: str) -> tuple[int, str, bytes] | None:
+    def get(self, key: str) -> tuple[int, str, bytes, bytes] | None:
         now = time.time()
         with self.lock:
             entry = self.items.get(key)
             if entry is None or entry[0] < now:
                 if entry is not None:
-                    self.bytes -= len(entry[3])
+                    self.bytes -= len(entry[3]) + len(entry[4])
                     self.items.pop(key, None)
                 self.misses += 1
                 return None
             self.hits += 1
-            return entry[1], entry[2], entry[3]
+            return entry[1], entry[2], entry[3], entry[4]
 
     def put(self, key: str, ttl: float, status: int, ctype: str, body: bytes) -> None:
         if ttl <= 0 or status != 200 or len(body) > self.max_bytes // 4:
             return
+        gz = gzip_bytes(body) if len(body) > 512 else b""
+        if gz and len(gz) >= len(body):
+            gz = b""
         now = time.time()
         with self.lock:
             old = self.items.pop(key, None)
             if old is not None:
-                self.bytes -= len(old[3])
-            while self.bytes + len(body) > self.max_bytes and self.items:
+                self.bytes -= len(old[3]) + len(old[4])
+            while self.bytes + len(body) + len(gz) > self.max_bytes and self.items:
                 victim = min(self.items.items(), key=lambda kv: kv[1][0])[0]
-                self.bytes -= len(self.items.pop(victim)[3])
-            self.items[key] = (now + ttl, status, ctype, body)
-            self.bytes += len(body)
+                dropped = self.items.pop(victim)
+                self.bytes -= len(dropped[3]) + len(dropped[4])
+            self.items[key] = (now + ttl, status, ctype, body, gz)
+            self.bytes += len(body) + len(gz)
 
     def stats(self) -> dict:
         with self.lock:
@@ -399,6 +406,13 @@ class RateLimiter:
 
 def etag_of(content: bytes) -> str:
     return '"' + hashlib.sha256(content).hexdigest()[:32] + '"'
+
+
+def gzip_bytes(data: bytes, level: int = 6) -> bytes:
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=level) as gz:
+        gz.write(data)
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------- passwords
@@ -667,9 +681,9 @@ class Handler(BaseHTTPRequestHandler):
         cache_key = key + "?" + query
         cached = self.store.cache.get(cache_key)
         if cached is not None:
-            status, ctype, body = cached
-            self.note(status, name, len(body), {"cache": "hit"})
-            return self.respond(status, body, headers={"Cache-Control": "no-store", "X-Cache": "hit"}, ctype=ctype)
+            status, ctype, raw, gz = cached
+            self.note(status, name, len(raw), {"cache": "hit"})
+            return self.emit_body(status, ctype, raw, gz, "hit")
         url = target + (("&" if "?" in target else "?") + query if query else "")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": self.GATEWAY_UA, "Accept-Encoding": "identity"})
@@ -687,7 +701,21 @@ class Handler(BaseHTTPRequestHandler):
         ttl = self.store.live_cache_ttl if key.startswith("live") else self.store.cache_ttl
         self.store.cache.put(cache_key, ttl, status, ctype, body)
         self.note(status, name, len(body), {"cache": "miss"})
-        return self.respond(status, body, headers={"Cache-Control": "no-store", "X-Cache": "miss"}, ctype=ctype)
+        gz = gzip_bytes(body) if status == 200 and len(body) > 512 else b""
+        return self.emit_body(status, ctype, body, gz, "miss")
+
+    def emit_body(self, status: int, ctype: str, raw: bytes, gz: bytes, cache_state: str) -> None:
+        """Send a gateway payload, gzipped when the client asked for it.
+
+        Live lists are 300-700 KB of text; the wire size drops roughly tenfold, which is the
+        single biggest lever on this box's egress.
+        """
+        headers = {"Cache-Control": "no-store", "X-Cache": cache_state, "Vary": "Accept-Encoding"}
+        payload = raw
+        if gz and "gzip" in self.headers.get("Accept-Encoding", "").lower():
+            payload = gz
+            headers["Content-Encoding"] = "gzip"
+        return self.respond(status, payload, headers=headers, ctype=ctype)
 
     # -- static config files (app "导入配置地址" targets) -------------------
     def serve_config(self, path: str) -> None:
@@ -700,10 +728,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(404, b"not found", ctype="text/plain")
         body = target.read_bytes()
         self.note(200, "config", len(body))
+        headers = {"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*", "Vary": "Accept-Encoding"}
+        if len(body) > 512 and "gzip" in self.headers.get("Accept-Encoding", "").lower():
+            body = gzip_bytes(body)
+            headers["Content-Encoding"] = "gzip"
         return self.respond(
             200,
             body,
-            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+            headers=headers,
             ctype="application/json; charset=utf-8",
         )
 

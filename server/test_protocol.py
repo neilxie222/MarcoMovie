@@ -251,7 +251,8 @@ def main():
 
         def do_GET(self):
             Upstream.calls += 1
-            body = json.dumps({"upstream": True, "path": self.path, "call": Upstream.calls}).encode()
+            body = json.dumps({"upstream": True, "path": self.path, "call": Upstream.calls,
+                               "pad": "x" * 4000}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -310,6 +311,21 @@ def main():
     store.cache_ttl = 30
     check("live lists use their own longer TTL", store.live_cache_ttl > store.cache_ttl, True)
     check("errors are never cached", request(port, "GET", f"/g/{token}/nope?ac=list")[0], 404)
+
+    print("gateway gzip")
+    import gzip as gzmod
+
+    status, gz_headers, gz_body = request(port, "GET", f"/g/{token}/demo?ac=list&pg=6",
+                                          headers={"Accept-Encoding": "gzip"})
+    check("gzip negotiated", gz_headers.get("Content-Encoding"), "gzip")
+    check("gzip body decodes to the same json",
+          json.loads(gzmod.decompress(gz_body))["path"], "/api.php/provide/vod?ac=list&pg=6")
+    status, plain_headers, plain_body = request(port, "GET", f"/g/{token}/demo?ac=list&pg=7")
+    check("no Accept-Encoding -> plain body", plain_headers.get("Content-Encoding"), None)
+    check("gzip is materially smaller", len(gz_body) * 4 < len(plain_body), True)
+    status, gz_headers, _ = request(port, "GET", f"/g/{token}/demo?ac=list&pg=6",
+                                    headers={"Accept-Encoding": "gzip"})
+    check("cached entry still serves gzip", gz_headers.get("Content-Encoding"), "gzip")
 
     print("gateway rate limit")
     store.add_device("burst", "default", "pw-burst")
